@@ -150,6 +150,7 @@ def to_mx(
     scaling_mode: ScaleCalculationMode = ScaleCalculationMode.FLOOR,
     pack_fp6: bool = False,
     is_swizzled_scales: bool = False,
+    gemm_kernel_choice: MXGemmKernelChoice = MXGemmKernelChoice.EMULATED,
 ):
     """
     Takes a high precision tensor and converts to MX scale and raw data, in
@@ -166,6 +167,10 @@ def to_mx(
     assert data_hp.is_contiguous(), "unsupported"
     assert elem_dtype in SUPPORTED_ELEM_DTYPES, "unsupported"
 
+    if gemm_kernel_choice == MXGemmKernelChoice.NEURON :
+        # print("the value is", scaling_mode.to_int())
+        return torch.quantize_mx(data_hp, -1, block_size, elem_dtype, 0)
+    
     orig_shape = data_hp.shape
     data_hp = data_hp.reshape(
         *orig_shape[:-1], orig_shape[-1] // block_size, block_size
@@ -604,7 +609,7 @@ class MXTensor(TorchAOBaseTensor):
         is_swizzled_scales: bool = False,
     ):
         scale_e8m0_biased, data_lp = to_mx(
-            data_hp, elem_dtype, block_size, scaling_mode, pack_fp6, is_swizzled_scales
+            data_hp, elem_dtype, block_size, scaling_mode, pack_fp6, is_swizzled_scales, gemm_kernel_choice
         )
         if isinstance(scale_e8m0_biased, DTensor):
             assert isinstance(data_lp, DTensor), "unsupported"
@@ -728,6 +733,17 @@ def _addmm_mx_dispatch(
                 bias=bias,
                 out_dtype=torch.bfloat16,
             )
+        elif gemm_choice == MXGemmKernelChoice.NEURON:
+            res = torch._scaled_mm(
+                    a.qdata,
+                    b.qdata,
+                    a._scale_e8m0,
+                    b._scale_e8m0,
+                    None, 
+                    None,
+                    torch.bfloat16,
+                    False
+                )
         else:
             assert a._elem_dtype == torch.float4_e2m1fn_x2
             assert b._elem_dtype == torch.float4_e2m1fn_x2
