@@ -20,6 +20,8 @@ from torchao.prototype.mx_formats.constants import (
 class MXGemmKernelChoice(Enum):
     # always available - MX operands are dequantized and a high precision
     # gemm is run
+    NEURON = "neuron"
+
     EMULATED = "emulated"
 
     # available only when CUDA capability is greater than or equal to 10.0
@@ -36,7 +38,7 @@ class MXFP8Dim1CastKernelChoice(Enum):
     Defines which kernel to use for mxfp8 casting. Currently custom casting kernels are
     only for scaling along dim1, and torch native code is always used for scaling along dim0.
     """
-
+    NEURON = "neuron"
     TRITON = "triton"
     CUDA = "cuda"
     TORCH = "torch"

@@ -150,6 +150,7 @@ def to_mx(
     scaling_mode: ScaleCalculationMode = ScaleCalculationMode.FLOOR,
     pack_fp6: bool = False,
     is_swizzled_scales: bool = False,
+    gemm_kernel_choice: MXGemmKernelChoice = MXGemmKernelChoice.EMULATED,
 ):
     """
     Takes a high precision tensor and converts to MX scale and raw data, in
@@ -166,6 +167,10 @@ def to_mx(
     assert data_hp.is_contiguous(), "unsupported"
     assert elem_dtype in SUPPORTED_ELEM_DTYPES, "unsupported"
 
+    if gemm_kernel_choice == MXGemmKernelChoice.NEURON :
+        # print("the value is", scaling_mode.to_int())
+        return torch.quantize_mx(data_hp, -1, block_size, elem_dtype, 0)
+    
     orig_shape = data_hp.shape
     data_hp = data_hp.reshape(
         *orig_shape[:-1], orig_shape[-1] // block_size, block_size
@@ -604,7 +609,7 @@ class MXTensor(TorchAOBaseTensor):
         is_swizzled_scales: bool = False,
     ):
         scale_e8m0_biased, data_lp = to_mx(
-            data_hp, elem_dtype, block_size, scaling_mode, pack_fp6, is_swizzled_scales
+            data_hp, elem_dtype, block_size, scaling_mode, pack_fp6, is_swizzled_scales, gemm_kernel_choice
         )
         if isinstance(scale_e8m0_biased, DTensor):
             assert isinstance(data_lp, DTensor), "unsupported"
@@ -728,6 +733,17 @@ def _addmm_mx_dispatch(
                 bias=bias,
                 out_dtype=torch.bfloat16,
             )
+        elif gemm_choice == MXGemmKernelChoice.NEURON:
+            res = torch._scaled_mm(
+                    a.qdata,
+                    b.qdata,
+                    a._scale_e8m0,
+                    b._scale_e8m0,
+                    None, 
+                    None,
+                    torch.bfloat16,
+                    False
+                )
         else:
             assert a._elem_dtype == torch.float4_e2m1fn_x2
             assert b._elem_dtype == torch.float4_e2m1fn_x2
@@ -918,3 +934,83 @@ def mx_select(func, types, args, kwargs):
         old_mx_tensor._is_swizzled_scales,
     )
     return return_and_correct_aliasing(func, args, kwargs, new_mx_tensor)
+
+# Add all_gather support
+@implements([torch.ops._c10d_functional.all_gather_into_tensor.default])
+def mx_all_gather(func, types, args, kwargs):
+    """
+    All-gather for MXTensor
+    
+    Args:
+        func: The operation (all_gather_into_tensor)
+        types: Tensor types involved
+        args: (mx_tensor, group_tag, ...)
+        kwargs: Additional arguments
+    """
+    mx_tensor = args[0]
+    group_tag = args[1] if len(args) > 1 else "default"
+
+    # Gather both data and scale
+    gathered_qdata = torch.ops._c10d_functional.all_gather_into_tensor.default(
+        mx_tensor.qdata,  # The quantized data
+        group_tag,
+        *args[2:],
+        **kwargs
+    )
+    
+    gathered_scale = torch.ops._c10d_functional.all_gather_into_tensor.default(
+        mx_tensor._scale_e8m0.view(torch.uint8),  # The scale factors
+        group_tag,
+        *args[2:],
+        **kwargs
+    )
+
+    gathered_scale=gathered_scale.view(torch.float8_e8m0fnu)
+    
+    # Return new MXTensor with gathered data
+    return MXTensor(
+        gathered_qdata,
+        gathered_scale,
+        mx_tensor._elem_dtype,
+        mx_tensor._block_size,
+        mx_tensor._orig_dtype,
+        mx_tensor._gemm_kernel_choice,
+        mx_tensor._pack_fp6,
+        mx_tensor.act_quant_kwargs
+    )
+
+@implements([torch.ops._c10d_functional.wait_tensor.default])
+def mx_wait_tensor(func, types, args, kwargs):
+    """
+    Wait for async collective to complete on MXTensor
+    
+    This is called after collectives like all_gather to ensure
+    the operation has completed before using the tensor.
+    """
+    mx_tensor = args[0]
+    
+    print("wait_tensor was run")
+    
+    # Wait on both components
+    waited_qdata = torch.ops._c10d_functional.wait_tensor.default(
+        mx_tensor.qdata,
+        *args[1:],
+        **kwargs
+    )
+    
+    waited_scale = torch.ops._c10d_functional.wait_tensor.default(
+        mx_tensor._scale_e8m0,
+        *args[1:],
+        **kwargs
+    )
+    
+    return MXTensor(
+        waited_qdata,
+        waited_scale,
+        mx_tensor._elem_dtype,
+        mx_tensor._block_size,
+        mx_tensor._orig_dtype,
+        mx_tensor._gemm_kernel_choice,
+        mx_tensor._pack_fp6,
+        mx_tensor.act_quant_kwargs
+    )
