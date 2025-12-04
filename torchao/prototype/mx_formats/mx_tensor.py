@@ -1014,3 +1014,67 @@ def mx_wait_tensor(func, types, args, kwargs):
         mx_tensor._pack_fp6,
         mx_tensor.act_quant_kwargs
     )
+
+# Add all_to_all support
+@implements([torch.ops._c10d_functional.all_to_all_single.default])
+def mx_all_to_all(func, types, args, kwargs):
+    """
+    All-to-all for MXTensor
+    
+    Args:
+        func: The operation (all_to_all_single)
+        types: Tensor types involved
+        args: (mx_tensor, output_split_sizes, input_split_sizes, group_tag, ...)
+        kwargs: Additional arguments
+        
+    Note: Currently only supports uniform splits (empty split size lists)
+    """
+    mx_tensor = args[0]
+    output_split_sizes = args[1] if len(args) > 1 else []
+    input_split_sizes = args[2] if len(args) > 2 else []
+    group_tag = args[3] if len(args) > 3 else "default"
+    
+    # Validate that split sizes are empty (uniform split only)
+    if output_split_sizes or input_split_sizes:
+        raise NotImplementedError(
+            "MXTensor all_to_all currently only supports uniform splits. "
+            "Please pass empty lists [] for output_split_sizes and input_split_sizes."
+        )
+
+    output_qdata=torch.randint(0, 256, (128, 256), dtype=torch.uint8).to(torch.float8_e5m2).to("neuron")
+    # All-to-all on quantized data
+    torch.distributed.all_to_all_single(
+        output_qdata,
+        mx_tensor.qdata,
+        [],  # output_split_sizes - empty for uniform split
+        [],  # input_split_sizes - empty for uniform split
+        group_tag,
+        *args[4:] if len(args) > 4 else [],
+        **kwargs
+    )
+    
+    output_scale = torch.randint(0, 256, (128, 8), dtype=torch.uint8).to("neuron")
+    # All-to-all on scale factors
+    torch.distributed.all_to_all_single(
+        output_scale,
+        mx_tensor._scale_e8m0.view(torch.uint8),
+        [],  # output_split_sizes - empty for uniform split
+        [],  # input_split_sizes - empty for uniform split
+        group_tag,
+        *args[4:] if len(args) > 4 else [],
+        **kwargs
+    )
+
+    output_scale = output_scale.view(torch.float8_e8m0fnu)
+    
+    # Return new MXTensor with all-to-all result
+    return MXTensor(
+        output_qdata,
+        output_scale,
+        mx_tensor._elem_dtype,
+        mx_tensor._block_size,
+        mx_tensor._orig_dtype,
+        mx_tensor._gemm_kernel_choice,
+        mx_tensor._pack_fp6,
+        mx_tensor.act_quant_kwargs
+    )
